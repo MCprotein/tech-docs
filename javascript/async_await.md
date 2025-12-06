@@ -72,6 +72,113 @@ Async/Await에서:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+#### 왜 힙에 저장해야 하는가?
+
+콜스택은 LIFO(Last In First Out) 구조다. 함수가 호출되면 스택 프레임이 쌓이고, 함수가 끝나면 스택 프레임이 제거된다. 이 구조에서는 **함수가 "중간에 멈춘 상태로 대기"할 수 없다**.
+
+```
+일반 함수 (콜스택만 사용):           async 함수 (힙도 사용):
+┌─────────────┐                    ┌─────────────┐
+│ foo()       │ ← 스택 프레임        │ (비어있음)   │
+│ - 로컬변수들 │   (return 시 삭제)   └─────────────┘
+│ - 실행위치   │
+└─────────────┘                    힙 메모리:
+                                   ┌───────────────────┐
+                                   │ AsyncFunctionObject│ ← 명시적으로 저장
+                                   │ - 로컬변수들        │   (GC 전까지 유지)
+                                   │ - 실행위치          │
+                                   └───────────────────┘
+```
+
+만약 콜스택에 foo()가 남아있으면서 "기다린다"면, 그 아래 있는 함수들도 모두 블로킹된다. JavaScript가 싱글 스레드에서 논블로킹으로 동작하려면, **await를 만난 함수는 콜스택에서 빠져나가야 한다**. 그래서 상태를 힙에 복사해두고 return하는 것이다.
+
+#### 힙에 저장된 상태는 어떻게 복원되는가?
+
+핵심은 **클로저(closure)**다. 마이크로태스크 큐에 담기는 것은 상태 자체가 아니라, **상태를 참조하는 콜백 함수**다.
+
+```
+힙 메모리:
+┌─────────────────────────┐
+│ AsyncFunctionObject     │ ← 여기에 계속 존재
+│ ├─ 로컬변수들           │
+│ ├─ 실행위치 (resume점)  │
+│ └─ Promise 참조         │
+└─────────────────────────┘
+           ↑
+           │ 참조 (클로저가 캡처)
+           │
+┌─────────────────────────┐
+│ on_resolve 콜백         │ ← 이게 마이크로태스크 큐에 들어감
+│ └─ AsyncFunctionObject  │   힙의 객체를 참조하고 있음
+└─────────────────────────┘
+```
+
+복원 과정:
+1. `on_resolve(result)` 콜백이 마이크로태스크 큐에서 꺼내져서 실행됨
+2. 이 콜백은 `AsyncFunctionObject`에 대한 참조를 클로저로 가지고 있음
+3. `ResumeGeneratorTrampoline(asyncFunctionObject, result)` 호출
+4. V8이 저장된 resume point로 점프해서 실행 재개
+
+#### 흔한 오해: "상태가 마이크로태스크 큐에 담긴다"
+
+**틀린 이해**:
+> `await a()`를 만나면 a()와 관련된 모든 상태가 스냅샷으로 마이크로태스크 큐에 담긴다
+
+**올바른 이해**:
+
+마이크로태스크 큐에 담기는 것은 **상태 자체가 아니라 콜백 함수**다. 상태(AsyncFunctionObject)는 힙 메모리에 그대로 있고, 콜백이 그 상태를 **참조**할 뿐이다.
+
+이 구분이 중요한 이유는 메모리와 성능 때문이다. 만약 상태 전체를 복사해서 큐에 넣는다면:
+- 로컬 변수가 많은 함수는 큐에 넣을 때마다 큰 메모리 복사가 발생
+- 같은 상태를 여러 곳에서 참조할 수 없음
+
+실제로는 포인터(참조) 하나만 큐에 들어가므로 효율적이다.
+
+```javascript
+async function foo() {
+  const x = 1;
+  const y = 2;
+  const result = await somePromise;  // 여기서 suspend
+  return x + y + result;
+}
+```
+
+```
+1. await 시점
+
+   힙:
+   ┌────────────────────────┐
+   │ AsyncFunctionObject    │
+   │ ├─ x = 1               │
+   │ ├─ y = 2               │
+   │ └─ resumePoint = 4번줄 │
+   └────────────────────────┘
+
+   somePromise 내부 reactions에 등록:
+   ┌────────────────────────┐
+   │ on_resolve 콜백        │
+   │ └─ ref → AsyncFunc... │ ← 포인터만 가지고 있음
+   └────────────────────────┘
+
+2. resolve(42) 호출 시
+
+   마이크로태스크 큐:
+   ┌────────────────────────┐
+   │ on_resolve(42)         │ ← 콜백 하나만 들어감 (상태 복사 X)
+   └────────────────────────┘
+
+   힙에 있는 AsyncFunctionObject는 그대로 있음
+
+3. 콜스택 비면 → on_resolve(42) 실행
+
+   → 콜백이 AsyncFunctionObject 참조해서 상태 복원
+   → resumePoint(4번줄)부터 실행 재개
+   → result = 42 할당
+   → return 1 + 2 + 42
+```
+
+**요약**: 상태가 "이동"하거나 "복사"되는 게 아니라, 힙에 계속 있고 콜백이 그걸 "참조"해서 복원한다.
+
 ### 왜 async/await 얘기에 Generator가 나오는가?
 
 **V8은 async/await를 Generator와 동일한 메커니즘으로 구현했기 때문이다.**
@@ -157,6 +264,18 @@ async generator는 `await`와 `yield`를 둘 다 사용할 수 있다.
 ### 한 줄 요약
 
 > **`await value`는 V8 내부에서 `value.then(onResolve, onReject)` 호출로 변환된다.**
+
+### async/await와 promise.then의 관계
+
+async/await가 promise.then으로 "변환"된다고 하면, 마치 컴파일 타임에 코드가 바뀌는 것처럼 오해할 수 있다. 실제로는 **둘 다 V8 내부에서 같은 Promise 인프라를 사용**한다.
+
+```
+async/await ──┐
+              ├──→ PerformPromiseThen() ──→ EnqueueMicrotask()
+promise.then ─┘
+```
+
+즉, async/await를 promise.then으로 "해석"하는 게 아니라, 둘 다 동일한 V8 내부 경로를 타기 때문에 같은 동작을 하는 것이다.
 
 ### 처리 과정 (단순화)
 
@@ -342,7 +461,7 @@ CONTINUE
 
 바이트코드가 실행되면 V8의 내장 함수(Builtin)가 호출된다.
 
-#### 3.1 Async 함수 시작: Promise 생성
+#### 3.1 Async 함수 시작: Promise 생성과 AsyncFunctionObject
 
 async 함수가 호출되면 가장 먼저 실행되는 부분:
 
@@ -383,7 +502,131 @@ const asyncFunctionObject = {
 return returnPromise;  // 즉시 Promise 반환
 ```
 
-#### 3.2 Await 실행: Promise.then() 연결 (핵심!)
+##### AsyncFunctionObject의 정체
+
+**의문**: AsyncFunctionObject가 foo 함수의 C++ 레벨 구현체인가?
+
+**아니다.** AsyncFunctionObject는 함수의 "구현체"가 아니라 **특정 호출의 "실행 상태"**를 저장하는 객체다.
+
+```
+foo 함수 코드 (JSFunction)        AsyncFunctionObject
+┌────────────────────┐           ┌────────────────────┐
+│ - 바이트코드       │           │ 현재 실행 중인      │
+│ - 소스맵 정보      │           │ foo() 호출의 상태   │
+│ - 스코프 정보      │           │                    │
+│                    │ ◀─────── │ function ──────────│
+└────────────────────┘           │ - x = 1            │
+      (한 번만 존재)              │ - y = 2            │
+                                 │ - resumePoint = 3  │
+                                 └────────────────────┘
+                                      (호출마다 생성)
+```
+
+**비유**:
+- JSFunction (함수 코드) = **레시피** (한 번만 존재)
+- AsyncFunctionObject = **요리 중간 상태** (호출마다 생성)
+  - 어떤 재료가 준비됐는지 (로컬 변수)
+  - 몇 단계까지 진행했는지 (resumePoint)
+
+**같은 async 함수를 여러 번 호출하면**:
+
+```javascript
+foo();  // AsyncFunctionObject #1 생성
+foo();  // AsyncFunctionObject #2 생성
+foo();  // AsyncFunctionObject #3 생성
+```
+
+각 호출마다 별도의 AsyncFunctionObject가 힙에 생성됨. 함수 코드는 하나지만, 실행 상태는 각각 따로 관리된다.
+
+**V8 소스에서 확인**:
+
+```cpp
+// src/objects/js-generator.h
+class JSAsyncFunctionObject : public JSGeneratorObject {
+  // JSGeneratorObject를 상속
+  // + promise 필드 추가
+};
+
+class JSGeneratorObject : public JSObject {
+  JSFunction function;           // 함수 코드 참조
+  Context context;               // 클로저 변수들
+  Object input_or_debug_pos;     // 재개 시 전달할 값
+  int resume_mode;               // kNext 또는 kThrow
+  int continuation;              // resumePoint (바이트코드 오프셋)
+  FixedArray parameters_and_registers;  // 로컬 변수들
+};
+```
+
+`function` 필드가 실제 함수 코드(JSFunction)를 가리키고, 나머지 필드들이 "이 호출의 현재 상태"를 저장한다.
+
+##### GC와 메모리 관리
+
+**의문 1**: 콜백이 참조해서 복원하면 힙에 있는 AsyncFunctionObject는 GC 되나?
+
+**async 함수가 완료되기 전까지는 GC되지 않는다.**
+
+참조 체인:
+```
+Promise 객체
+  └─ reactions 리스트
+       └─ on_resolve 콜백 (클로저)
+            └─ AsyncFunctionObject 참조  ← 이 참조가 있어서 GC 안 됨
+```
+
+async 함수가 완전히 끝나면 (return 또는 throw):
+1. 콜백이 실행되고 콜스택에서 사라짐
+2. 더 이상 AsyncFunctionObject를 참조하는 게 없음
+3. GC 대상이 됨
+
+**의문 2**: 마이크로태스크 큐에서 복원해서 완료하기 전까지 함수 코드도 메모리에 떠있어야 하는 거 아닌가?
+
+**맞다.** AsyncFunctionObject가 JSFunction(함수 코드)을 참조하고 있으므로, 함수 코드도 GC되지 않는다.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        힙 메모리                             │
+│                                                              │
+│  ┌──────────────────┐       ┌────────────────────────┐      │
+│  │ JSFunction       │ ◀──── │ AsyncFunctionObject    │      │
+│  │ (foo 함수 코드)   │       │                        │      │
+│  │                  │       │ function ────────────┘ │      │
+│  │ - 바이트코드     │       │ - x = 1                │      │
+│  │ - 소스맵 정보    │       │ - y = 2                │      │
+│  └──────────────────┘       │ - resumePoint = 3      │      │
+│         ↑                   └────────────────────────┘      │
+│         │                              ↑                     │
+│         │              ┌───────────────┘                     │
+│         │              │                                     │
+│  ┌──────┴───────┐     │                                     │
+│  │ 모듈/스크립트 │     │  ← 이 참조들이 있어서 GC 안 됨       │
+│  │ 스코프        │     │                                     │
+│  └──────────────┘     │                                     │
+│                       │                                     │
+│  마이크로태스크 큐:    │                                     │
+│  ┌────────────────────┴──┐                                  │
+│  │ on_resolve 콜백       │                                  │
+│  └───────────────────────┘                                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**GC 관점 참조 체인**:
+
+```
+on_resolve 콜백 (마이크로태스크 큐에 있음)
+  └─→ AsyncFunctionObject (힙)
+        ├─→ JSFunction (함수 코드) ← 이것도 참조됨!
+        ├─→ 로컬 변수들
+        └─→ resumePoint
+```
+
+따라서 async 함수가 완료되기 전까지:
+- AsyncFunctionObject (실행 상태) ✅ 힙에 유지
+- JSFunction (함수 코드) ✅ 힙에 유지
+- 둘 다 GC되지 않음
+
+참고로 JSFunction은 보통 모듈/스크립트 스코프에서도 참조되므로, AsyncFunctionObject가 없어도 GC되지 않는 경우가 많다. 하지만 V8은 안전하게 AsyncFunctionObject → JSFunction 참조도 유지한다.
+
+#### 3.2 Await 실행: Promise에 콜백 등록 (핵심!)
 
 `await value`를 만나면 실행되는 부분:
 
@@ -432,12 +675,205 @@ function on_reject(error) {
   generator.resume(error, 'throw');
 }
 
-// 3. ★ 핵심: then 연결 ★
+// 3. ★ 핵심: Promise에 콜백 등록 ★
 value.then(on_resolve, on_reject);
 
 // 4. 여기서 함수가 콜스택에서 빠져나감 (return)
 //    on_resolve/on_reject는 Promise 완료 시 마이크로태스크 큐에 추가됨
 ```
+
+##### "Promise에 콜백을 등록한다"는 게 무슨 뜻인가?
+
+Promise 객체 내부에 콜백을 저장한다는 뜻이다.
+
+```javascript
+const promise = new Promise((resolve) => {
+  setTimeout(() => resolve(42), 1000);
+});
+
+promise.then(callback1);  // ← callback1을 Promise 내부에 저장
+promise.then(callback2);  // ← callback2도 Promise 내부에 저장
+```
+
+**Promise 객체 내부 구조**:
+
+```
+┌─────────────────────────────────┐
+│ Promise 객체                    │
+│                                 │
+│ status: "pending"               │
+│ result: undefined               │
+│ reactions: [callback1, callback2] ← 여기에 저장됨
+│                                 │
+└─────────────────────────────────┘
+```
+
+`.then(callback)`을 호출하면:
+1. callback이 실행되는 게 아님
+2. Promise 내부의 reactions 배열에 추가만 됨
+3. `.then()` 즉시 반환
+
+나중에 `resolve(42)` 호출되면:
+1. reactions 배열에 있는 콜백들을 마이크로태스크 큐에 추가
+2. 이벤트 루프가 꺼내서 실행
+
+##### reactions란?
+
+V8 내부에서 Promise 객체가 가지고 있는 **콜백 저장소** 이름이다.
+
+JavaScript에서는 안 보이지만, V8 C++ 코드에서는 이렇게 생김:
+
+```cpp
+// V8 소스: src/objects/js-promise.h
+class JSPromise : public JSObject {
+  int status;                    // pending, fulfilled, rejected
+  Object result;                 // resolve된 값 또는 reject된 에러
+  Object reactions_or_result;    // ← 이게 reactions
+};
+```
+
+**reactions = "반응할 것들"**
+
+```javascript
+const p = fetch('/api');
+
+p.then(onSuccess1);  // reaction 1 등록
+p.then(onSuccess2);  // reaction 2 등록
+p.catch(onError);    // reaction 3 등록
+```
+
+```
+Promise 객체 (p)
+┌────────────────────────────────────┐
+│ status: "pending"                  │
+│ reactions: ──────────────────────┐ │
+│   ┌─────────────┐                │ │
+│   │ reaction 1  │ → onSuccess1   │ │
+│   │ reaction 2  │ → onSuccess2   │ │
+│   │ reaction 3  │ → onError      │ │
+│   └─────────────┘                │ │
+└────────────────────────────────────┘
+```
+
+Promise가 resolve되면 → 저장된 reactions 전부 마이크로태스크 큐로 이동
+
+그냥 **"나중에 실행할 콜백 목록"**이라고 생각하면 됨. "reactions"라고 부르는 이유는 "Promise가 완료되면 반응(react)할 함수들"이라서.
+
+```javascript
+// 이렇게 생각하면 됨 (의사 코드)
+class Promise {
+  status = "pending";
+  result = undefined;
+  reactions = [];  // 콜백 저장소
+
+  then(callback) {
+    if (this.status === "pending") {
+      this.reactions.push(callback);  // 등록 = 배열에 추가
+    } else {
+      EnqueueMicrotask(() => callback(this.result));
+    }
+  }
+
+  resolve(value) {
+    this.status = "fulfilled";
+    this.result = value;
+    // 등록된 콜백들을 마이크로태스크 큐에 추가
+    for (const cb of this.reactions) {
+      EnqueueMicrotask(() => cb(value));
+    }
+  }
+}
+```
+
+**"등록" = Promise 내부 배열에 저장**
+
+##### callback이 reactions에 담기는 타이밍
+
+```javascript
+asyncFunction().then(callback)
+```
+
+**callback이 reactions에 담기는 건 `.then()` 호출 시점**이다. `resolve()` 시점이 아님.
+
+```
+시간 →
+
+1. asyncFunction() 호출
+   → Promise 즉시 반환 (pending 상태)
+   → asyncFunction 내부 코드 실행 시작
+
+2. .then(callback) 호출  ← 이 시점에 reactions에 저장!
+   ┌─────────────────────────┐
+   │ Promise                 │
+   │ status: "pending"       │
+   │ reactions: [callback]   │ ← 여기에 들어감
+   └─────────────────────────┘
+
+3. asyncFunction 내부에서 resolve(결과) 호출
+   → reactions에 있던 callback을 마이크로태스크 큐로 이동
+   ┌─────────────────────────┐
+   │ Promise                 │
+   │ status: "fulfilled"     │
+   │ reactions: []           │ ← 비워짐
+   └─────────────────────────┘
+
+   마이크로태스크 큐: [callback(결과)]
+
+4. 콜스택 비면 → callback(결과) 실행
+```
+
+##### await 이후 코드는 콜백으로 취급된다
+
+```javascript
+async function foo() {
+  console.log('A');
+  const result = await asyncFunction();
+  console.log('B');   // ┐
+  console.log('C');   // ├─ 이 부분이 콜백으로 감싸짐
+  return result;      // ┘
+}
+```
+
+**V8 내부적으로는 이렇게 변환된다:**
+
+```javascript
+function foo() {
+  console.log('A');
+
+  return asyncFunction().then((result) => {
+    console.log('B');   // ┐
+    console.log('C');   // ├─ on_resolve 콜백 안에 들어감
+    return result;      // ┘
+  });
+}
+```
+
+**await가 여러 개면:**
+
+```javascript
+async function foo() {
+  const a = await promise1;
+  const b = await promise2;
+  return a + b;
+}
+
+// 이렇게 변환됨 (개념적으로)
+function foo() {
+  return promise1.then((a) => {
+    return promise2.then((b) => {
+      return a + b;
+    });
+  });
+}
+```
+
+**정리:**
+
+| 코드 | 역할 |
+|------|------|
+| `.then(callback)` | callback을 Promise.reactions에 저장 |
+| `resolve(값)` | reactions에 있는 콜백들을 마이크로태스크 큐로 이동 |
+| `await something` | "await 이후 코드"를 콜백으로 만들어서 something.reactions에 저장 |
 
 **콜스택 관점에서 보면:**
 ```
@@ -457,6 +893,81 @@ await 실행 직전:                    await 실행 직후:
 #### 3.3 Promise 완료 후: 함수 재개
 
 Promise가 resolve/reject되면 **마이크로태스크 큐**에 콜백이 추가된다.
+
+##### Promise resolve 시 마이크로태스크 큐 동작 원리
+
+**의문**: JavaScript 코드로 보면 `.then()`이나 `resolve()`가 blocking처럼 보이는데, 어떻게 non-blocking인가?
+
+```javascript
+promise.then(callback);  // 이게 끝날 때까지 기다리는 것처럼 보임
+resolve(value);          // 이게 callback을 실행하는 것처럼 보임
+```
+
+**실제 동작 (V8 내부)**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. promise.then(callback) 호출 시                                │
+│                                                                  │
+│    Promise가 pending 상태면:                                      │
+│    ┌───────────────────────────────┐                             │
+│    │ Promise 객체 내부             │                             │
+│    │ ├─ status: "pending"         │                             │
+│    │ └─ reactions: [callback]  ◀──┼── 여기에 저장만 하고 즉시 반환 │
+│    └───────────────────────────────┘                             │
+│                                                                  │
+│    Promise가 이미 fulfilled 상태면:                               │
+│    → EnqueueMicrotask(callback) 즉시 호출 후 반환                 │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. resolve(value) 호출 시                                        │
+│                                                                  │
+│    V8 내부에서 TriggerPromiseReactions() 호출                     │
+│    → 저장된 모든 reactions를 순회하며                              │
+│    → 각각 EnqueueMicrotask(reaction) 호출                        │
+│    → 즉시 반환 (콜백 실행하지 않음!)                                │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 3. 콜스택이 비면                                                  │
+│                                                                  │
+│    이벤트 루프가 마이크로태스크 큐에서 콜백을 꺼내서 실행            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**V8 소스 코드 (Torque)** - `src/builtins/promise-abstract-operations.tq`:
+
+```cpp
+// Promise가 resolve될 때 호출됨
+macro TriggerPromiseReactions(reactions, argument, reactionType) {
+  // 저장된 모든 reaction을 순회
+  while (currentReaction != Undefined) {
+    // 각 reaction을 마이크로태스크 큐에 추가
+    MorphAndEnqueuePromiseReaction(currentReaction, argument, reactionType);
+    currentReaction = currentReaction.next;
+  }
+}
+
+// 실제로 마이크로태스크 큐에 추가하는 부분
+macro MorphAndEnqueuePromiseReaction(...) {
+  const promiseReactionJobTask = NewPromiseReactionJobTask(...);
+  EnqueueMicrotask(handlerContext, promiseReactionJobTask);  // ← 핵심!
+}
+```
+
+**Non-blocking인 이유 요약**:
+
+| 동작 | 실제로 하는 일 | blocking 여부 |
+|------|--------------|--------------|
+| `.then(cb)` | reactions 배열에 cb 저장 | ❌ 즉시 반환 |
+| `resolve(v)` | 마이크로태스크 큐에 추가만 함 | ❌ 즉시 반환 |
+| 콜백 실행 | 이벤트 루프가 나중에 실행 | ❌ 별도 타이밍 |
+
+핵심은 `resolve()`가 콜백을 **직접 실행하지 않고** 마이크로태스크 큐에 **추가만** 한다는 것이다.
+
+##### 이벤트 루프가 콜백 실행
+
 이벤트 루프가 콜스택이 비었을 때 마이크로태스크 큐에서 콜백을 꺼내서 실행한다:
 
 ```
@@ -662,71 +1173,6 @@ Call Stack:    │log(A)│foo()│log(1)│await│    │log(B)│    │on_re
 출력:              A           1                  B                    2
 ```
 
-### JavaScript로 표현한 내부 동작
-
-```javascript
-// 원본 코드
-async function foo() {
-  console.log('start');
-  const result = await somePromise;
-  console.log('end');
-  return result;
-}
-
-// V8 내부 동작 (의사 코드)
-function foo() {
-  console.log('start');
-
-  // 1. 반환할 Promise 생성
-  const returnPromise = new Promise((resolve, reject) => {
-
-    // 2. await를 then으로 변환
-    Promise.resolve(somePromise).then(
-      // 3a. 성공 시 - 마이크로태스크로 실행됨
-      (result) => {
-        console.log('end');
-        resolve(result);  // returnPromise를 resolve
-      },
-      // 3b. 실패 시 - 마이크로태스크로 실행됨
-      (error) => {
-        reject(error);    // returnPromise를 reject
-      }
-    );
-  });
-
-  return returnPromise;  // 즉시 반환! (await 이후 코드는 나중에 실행)
-}
-```
-
-### 핵심 포인트 정리
-
-| 개념 | 설명 |
-|------|------|
-| **async function** | 항상 Promise를 반환하는 함수. 내부적으로 generator처럼 동작 |
-| **await** | 함수 실행을 중단하고, Promise가 완료되면 재개 |
-| **내부 변환** | `await value` → `value.then(onResolve, onReject)` |
-| **suspend** | 콜스택에서 빠져나감 + 상태를 힙에 저장 |
-| **resume** | 마이크로태스크 큐 → 콜스택 진입 + 상태 복원 |
-| **마이크로태스크** | Promise.then 콜백이 들어가는 큐. setTimeout보다 먼저 실행 |
-| **resume mode** | `kNext`(성공, 값 반환) 또는 `kThrow`(실패, 에러 발생) |
-
----
-
-## 주요 파일 경로
-
-| 역할 | 파일 경로 | 핵심 내용 |
-|------|----------|----------|
-| AST 정의 | `src/ast/ast.h` | Await, Suspend 클래스 정의 |
-| 파싱 | `src/parsing/parser-base.h:3793` | await 표현식 파싱 |
-| 바이트코드 생성 | `src/interpreter/bytecode-generator.cc:6337` | await → suspend/resume 변환 |
-| **Promise.then 연결** | `src/builtins/builtins-async-gen.cc:159` | **핵심! await → then 변환** |
-| 함수 시작 | `src/builtins/builtins-async-function-gen.cc:66` | Promise 생성 |
-| 함수 재개 | `src/builtins/builtins-async-function-gen.cc:32` | Promise 완료 후 resume |
-
----
-
-## 부록
-
 ### 마이크로태스크 vs 태스크(매크로태스크) 큐
 
 Promise.then() 콜백은 **마이크로태스크 큐**에 들어간다:
@@ -778,7 +1224,73 @@ console.log('sync 2');
 // 출력: sync 1, async 1, sync 2, async 2, timeout
 ```
 
-### C++ 코드 읽는 법 (간단 가이드)
+### JavaScript로 표현한 내부 동작
+
+```javascript
+// 원본 코드
+async function foo() {
+  console.log('start');
+  const result = await somePromise;
+  console.log('end');
+  return result;
+}
+
+// V8 내부 동작 (의사 코드)
+function foo() {
+  console.log('start');
+
+  // 1. 반환할 Promise 생성
+  const returnPromise = new Promise((resolve, reject) => {
+
+    // 2. await를 then으로 변환
+    Promise.resolve(somePromise).then(
+      // 3a. 성공 시 - 마이크로태스크로 실행됨
+      (result) => {
+        console.log('end');
+        resolve(result);  // returnPromise를 resolve
+      },
+      // 3b. 실패 시 - 마이크로태스크로 실행됨
+      (error) => {
+        reject(error);    // returnPromise를 reject
+      }
+    );
+  });
+
+  return returnPromise;  // 즉시 반환! (await 이후 코드는 나중에 실행)
+}
+```
+
+### 핵심 포인트 정리
+
+| 개념 | 설명 |
+|------|------|
+| **async function** | 항상 Promise를 반환하는 함수. 내부적으로 generator처럼 동작 |
+| **await** | 함수 실행을 중단하고, Promise가 완료되면 재개 |
+| **내부 변환** | `await value` → `value.then(onResolve, onReject)` |
+| **suspend** | 콜스택에서 빠져나감 + 상태를 힙에 저장 |
+| **resume** | 마이크로태스크 큐 → 콜스택 진입 + 상태 복원 |
+| **마이크로태스크** | Promise.then 콜백이 들어가는 큐. setTimeout보다 먼저 실행 |
+| **resume mode** | `kNext`(성공, 값 반환) 또는 `kThrow`(실패, 에러 발생) |
+| **reactions** | Promise 내부의 콜백 저장소. "나중에 실행할 콜백 목록" |
+
+---
+
+## 주요 파일 경로
+
+| 역할 | 파일 경로 | 핵심 내용 |
+|------|----------|----------|
+| AST 정의 | `src/ast/ast.h` | Await, Suspend 클래스 정의 |
+| 파싱 | `src/parsing/parser-base.h:3793` | await 표현식 파싱 |
+| 바이트코드 생성 | `src/interpreter/bytecode-generator.cc:6337` | await → suspend/resume 변환 |
+| **Promise.then 연결** | `src/builtins/builtins-async-gen.cc:159` | **핵심! await → then 변환** |
+| 함수 시작 | `src/builtins/builtins-async-function-gen.cc:66` | Promise 생성 |
+| 함수 재개 | `src/builtins/builtins-async-function-gen.cc:32` | Promise 완료 후 resume |
+| Promise 내부 | `src/objects/js-promise.h` | reactions 등 Promise 구조 |
+| Promise resolve | `src/builtins/promise-abstract-operations.tq` | TriggerPromiseReactions |
+
+---
+
+## C++ 코드 읽는 법 (간단 가이드)
 
 V8 코드에서 자주 보이는 패턴:
 
